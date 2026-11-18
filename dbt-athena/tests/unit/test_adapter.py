@@ -3,6 +3,7 @@ import decimal
 from datetime import date, timedelta
 from multiprocessing import get_context
 import sys
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +20,7 @@ from mypy_boto3_glue.client import GlueClient
 from dbt.adapters.athena import AthenaAdapter
 from dbt.adapters.athena import Plugin as AthenaPlugin
 from dbt.adapters.athena.column import AthenaColumn
-from dbt.adapters.athena.exceptions import S3LocationException
+from dbt.adapters.athena.exceptions import AthenaQueryFailedError, S3LocationException
 from dbt.adapters.athena.relation import AthenaRelation, TableType
 from dbt.adapters.athena.utils import AthenaCatalogType
 from dbt.adapters.contracts.connection import ConnectionState
@@ -37,6 +38,43 @@ from .constants import (
 )
 from .fixtures import seed_data
 from .utils import TestAdapterConversions, config_from_parts_or_dicts, inject_adapter
+
+
+class _FakeAthenaCtas:
+    """Runs a CTAS into one Glue table the way Athena does. `retry` creates the table, then
+    fails on it, as Athena's internal retry does."""
+
+    def __init__(self, glue, catalog_id, outcomes):
+        self.glue = glue
+        self.catalog_id = catalog_id
+        self.outcomes = list(outcomes)
+        self.queries = []
+
+    def tables(self):
+        listed = self.glue.get_tables(CatalogId=self.catalog_id, DatabaseName="ns")["TableList"]
+        return [table["Name"] for table in listed]
+
+    def __call__(self, sql):
+        self.queries.append(sql)
+        assert self.outcomes, f"query {len(self.queries)} was not expected: {sql}"
+        outcome = self.outcomes.pop(0)
+
+        if outcome == "error":
+            raise AthenaQueryFailedError({"ErrorMessage": "GENERIC_INTERNAL_ERROR: boom"})
+
+        already_exists = AthenaQueryFailedError(
+            {"ErrorMessage": "TABLE_ALREADY_EXISTS: Destination table 't__dbt_tmp' already exists"}
+        )
+        if "t__dbt_tmp" in self.tables():
+            raise already_exists
+
+        self.glue.create_table(
+            CatalogId=self.catalog_id, DatabaseName="ns", TableInput={"Name": "t__dbt_tmp"}
+        )
+        if outcome == "retry":
+            raise already_exists
+
+        return SimpleNamespace(rowcount=3, data_scanned_in_bytes=10)
 
 
 class TestAthenaAdapter:
@@ -1499,6 +1537,76 @@ class TestAthenaAdapter:
         assert delete_table is None
         error_msg = f"Table {relation.render()} does not exist and will not be deleted, ignoring"
         assert error_msg in dbt_debug_caplog.getvalue()
+
+    def _ctas_target(self, database, outcomes, leftover=False):
+        glue = boto3.client("glue", region_name=AWS_REGION)
+        catalog_id = (
+            DEFAULT_ACCOUNT_ID
+            if database == "awsdatacatalog"
+            else f"{DEFAULT_ACCOUNT_ID}:{database}"
+        )
+        glue.create_database(CatalogId=catalog_id, DatabaseInput={"Name": "ns"})
+
+        if leftover:
+            glue.create_table(
+                CatalogId=catalog_id, DatabaseName="ns", TableInput={"Name": "t__dbt_tmp"}
+            )
+
+        athena = _FakeAthenaCtas(glue, catalog_id, outcomes)
+        self.adapter.acquire_connection("dummy")
+        self.adapter._run_query = athena
+        relation = self.adapter.Relation.create(
+            database=database, schema="ns", identifier="t__dbt_tmp"
+        )
+        return athena, relation
+
+    @mock_aws
+    @pytest.mark.parametrize(
+        ("outcomes", "leftover"),
+        [(["retry", "ok"], False), (["ok", "ok"], True)],
+        ids=["athena-internal-retry", "leftover-of-a-killed-run"],
+    )
+    def test_ctas_drops_its_s3_tables_target_and_runs_again(
+        self, dbt_debug_caplog, outcomes, leftover
+    ):
+        athena, relation = self._ctas_target("s3tablescatalog/b", outcomes, leftover)
+
+        result = self.adapter.run_query_with_partitions_limit_catching("create table t", relation)
+
+        assert result == '{"rowcount":3,"data_scanned_in_bytes":10}'
+        assert athena.queries == ["create table t", "create table t"]
+        assert athena.tables() == ["t__dbt_tmp"]
+        assert "dropping it and running the CTAS again" in dbt_debug_caplog.getvalue()
+
+    @mock_aws
+    def test_ctas_fails_when_the_second_run_hits_its_target_too(self):
+        athena, relation = self._ctas_target("s3tablescatalog/b", ["retry", "retry"])
+
+        with pytest.raises(AthenaQueryFailedError, match="TABLE_ALREADY_EXISTS"):
+            self.adapter.run_query_with_partitions_limit_catching("create table t", relation)
+
+        assert athena.queries == ["create table t", "create table t"]
+
+    @mock_aws
+    @pytest.mark.parametrize(
+        ("database", "pass_relation", "outcomes"),
+        [
+            ("s3tablescatalog/b", False, ["retry"]),
+            ("awsdatacatalog", True, ["retry"]),
+            ("s3tablescatalog/b", True, ["error"]),
+        ],
+        ids=["no-relation", "glue-catalog", "other-error"],
+    )
+    def test_ctas_failure_keeps_the_table(self, database, pass_relation, outcomes):
+        athena, relation = self._ctas_target(database, outcomes, leftover=outcomes == ["error"])
+
+        with pytest.raises(AthenaQueryFailedError):
+            self.adapter.run_query_with_partitions_limit_catching(
+                "create table t", relation if pass_relation else None
+            )
+
+        assert athena.queries == ["create table t"]
+        assert athena.tables() == ["t__dbt_tmp"]
 
     @mock_aws
     def test__get_relation_type_table(self, dbt_debug_caplog, mock_aws_service):

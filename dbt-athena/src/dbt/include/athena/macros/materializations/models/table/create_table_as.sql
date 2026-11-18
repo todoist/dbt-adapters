@@ -224,7 +224,7 @@
   {%- endif -%}
 
   {%- if temporary -%}
-    {%- do run_query(create_table_as(temporary, relation, compiled_code, language, true)) -%}
+    {%- do adapter.run_query_with_partitions_limit_catching(create_table_as(temporary, relation, compiled_code, language, true), relation) -%}
     {{ return(relation ~ ' as temporary relation without partitioning created') }}
   {%- endif -%}
 

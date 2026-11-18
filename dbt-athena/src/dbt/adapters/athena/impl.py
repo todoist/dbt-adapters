@@ -1841,13 +1841,30 @@ class AthenaAdapter(SQLAdapter):
         return {k: v for k, v in table.items() if k in TableInputTypeDef.__annotations__}
 
     @available
-    def run_query_with_partitions_limit_catching(self, sql: str) -> str:
+    def run_query_with_partitions_limit_catching(
+        self, sql: str, relation: Optional[AthenaRelation] = None
+    ) -> str:
         try:
             cursor = self._run_query(sql)
         except AthenaError as e:
             if "TOO_MANY_OPEN_PARTITIONS" in str(e):
                 return "TOO_MANY_OPEN_PARTITIONS"
+
+            # Athena's internal retry of one CTAS can hit the table its first attempt created.
+            if (
+                relation is not None
+                and "TABLE_ALREADY_EXISTS" in str(e)
+                and self.is_s3_tables_database(relation.database)
+            ):
+                LOGGER.warning(
+                    f"{relation.render()} already exists after its CTAS failed, "
+                    "dropping it and running the CTAS again"
+                )
+                self.delete_from_glue_catalog(relation)
+                return self.run_query_with_partitions_limit_catching(sql)
+
             raise e
+
         return f'{{"rowcount":{cursor.rowcount},"data_scanned_in_bytes":{cursor.data_scanned_in_bytes}}}'
 
     @available
